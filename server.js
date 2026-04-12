@@ -440,41 +440,162 @@ app.post("/api/social/report", auth, async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════
+   ROOM MANAGEMENT API
+═══════════════════════════════════════════════════════════ */
+const gameRooms = {}; // { code: { code, host, players, spectators, map, status, created } }
+
+function makeRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// Create room
+app.post("/api/rooms/create", auth, async (req, res) => {
+  try {
+    const u = await get("SELECT * FROM users WHERE uid=?", [req.uid]);
+    let code = makeRoomCode();
+    while (gameRooms[code]) code = makeRoomCode(); // ensure unique
+    const { map = "station" } = req.body;
+    gameRooms[code] = {
+      code, map, status: "waiting",
+      host: { uid: u.uid, nickname: u.nickname, avatar: u.avatar },
+      players: [{ uid: u.uid, nickname: u.nickname, avatar: u.avatar, ready: true, isHost: true }],
+      spectators: [],
+      created: Date.now()
+    };
+    console.log(`🏠 Room created: ${code} by ${u.nickname}`);
+    res.json({ code, room: gameRooms[code] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get room info
+app.get("/api/rooms/:code", auth, async (req, res) => {
+  const room = gameRooms[req.params.code.toUpperCase()];
+  if (!room) return res.status(404).json({ error: "Room not found" });
+  res.json(room);
+});
+
+// Join room
+app.post("/api/rooms/:code/join", auth, async (req, res) => {
+  try {
+    const code = req.params.code.toUpperCase();
+    const room = gameRooms[code];
+    if (!room) return res.status(404).json({ error: "Room not found. Check the code!" });
+    if (room.status !== "waiting") return res.status(400).json({ error: "Game already started!" });
+    if (room.players.length >= 12) return res.status(400).json({ error: "Room is full!" });
+    const u = await get("SELECT * FROM users WHERE uid=?", [req.uid]);
+    const { mode = "play" } = req.body; // "play" or "watch"
+    const player = { uid: u.uid, nickname: u.nickname, avatar: u.avatar, ready: false, isHost: false };
+    if (mode === "watch") {
+      room.spectators = room.spectators.filter(s => s.uid !== u.uid);
+      room.spectators.push(player);
+    } else {
+      room.players = room.players.filter(p => p.uid !== u.uid);
+      room.players.push(player);
+    }
+    io.to(code).emit("room_update", room);
+    console.log(`👤 ${u.nickname} joined room ${code} as ${mode}`);
+    res.json({ code, room, mode });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// List active rooms (admin)
+app.get("/api/rooms", auth, async (req, res) => {
+  const list = Object.values(gameRooms).map(r => ({
+    code: r.code, map: r.map, status: r.status,
+    players: r.players.length, spectators: r.spectators.length,
+    host: r.host?.nickname, created: r.created
+  }));
+  res.json(list);
+});
+
+/* ═══════════════════════════════════════════════════════════
    SOCKET.IO
 ═══════════════════════════════════════════════════════════ */
-const rooms = {};
 io.on("connection", (socket) => {
   console.log("🔌 Player connected:", socket.id);
 
-  socket.on("join_room", ({ room, user }) => {
+  socket.on("join_room", ({ code, user }) => {
+    const room = code?.toUpperCase();
     socket.join(room);
-    if (!rooms[room]) rooms[room] = { players: [] };
-    rooms[room].players = rooms[room].players.filter(p => p.uid !== user?.uid);
-    if (user) rooms[room].players.push({ ...user, socketId: socket.id });
-    io.to(room).emit("room_update", rooms[room]);
+    // Track socket id for disconnect cleanup
+    if (gameRooms[room]) {
+      const p = gameRooms[room].players.find(p => p.uid === user?.uid);
+      if (p) p.socketId = socket.id;
+      io.to(room).emit("room_update", gameRooms[room]);
+    }
+    // Legacy support
+    socket.currentRoom = room;
+    socket.currentUid = user?.uid;
   });
 
-  socket.on("leave_room", ({ room }) => {
+  socket.on("leave_room", ({ code }) => {
+    const room = code?.toUpperCase();
     socket.leave(room);
-    if (rooms[room]) {
-      rooms[room].players = rooms[room].players.filter(p => p.socketId !== socket.id);
-      io.to(room).emit("room_update", rooms[room]);
+    if (gameRooms[room]) {
+      gameRooms[room].players = gameRooms[room].players.filter(p => p.socketId !== socket.id);
+      gameRooms[room].spectators = gameRooms[room].spectators.filter(p => p.socketId !== socket.id);
+      if (gameRooms[room].players.length === 0) {
+        delete gameRooms[room];
+        console.log(`🗑️ Room ${room} deleted (empty)`);
+      } else {
+        io.to(room).emit("room_update", gameRooms[room]);
+      }
     }
   });
 
-  socket.on("game_event", ({ room, event, data }) => {
-    socket.to(room).emit("game_event", { event, data });
+  socket.on("player_ready", ({ code, uid, ready }) => {
+    const room = code?.toUpperCase();
+    if (gameRooms[room]) {
+      const p = gameRooms[room].players.find(p => p.uid === uid);
+      if (p) p.ready = ready;
+      io.to(room).emit("room_update", gameRooms[room]);
+    }
   });
 
-  socket.on("chat_msg", ({ room, msg }) => {
-    io.to(room).emit("chat", msg);
+  socket.on("start_game", ({ code, map }) => {
+    const room = code?.toUpperCase();
+    if (gameRooms[room]) {
+      gameRooms[room].status = "playing";
+      gameRooms[room].map = map || gameRooms[room].map;
+      io.to(room).emit("game_start", { room: gameRooms[room] });
+      console.log(`🎮 Game started in room ${room}`);
+    }
+  });
+
+  socket.on("game_event", ({ code, room, event, data }) => {
+    const r = (code || room)?.toUpperCase();
+    socket.to(r).emit("game_event", { event, data });
+  });
+
+  socket.on("chat_msg", ({ code, room, msg }) => {
+    const r = (code || room)?.toUpperCase();
+    io.to(r).emit("chat", msg);
+  });
+
+  socket.on("kick_player", ({ code, uid }) => {
+    const room = code?.toUpperCase();
+    if (gameRooms[room]) {
+      gameRooms[room].players = gameRooms[room].players.filter(p => p.uid !== uid);
+      io.to(room).emit("room_update", gameRooms[room]);
+      io.to(room).emit("kicked", { uid });
+    }
   });
 
   socket.on("disconnect", () => {
-    Object.keys(rooms).forEach(room => {
-      if (!rooms[room]?.players) return;
-      rooms[room].players = rooms[room].players.filter(p => p.socketId !== socket.id);
-      io.to(room).emit("room_update", rooms[room]);
+    Object.keys(gameRooms).forEach(code => {
+      const room = gameRooms[code];
+      if (!room) return;
+      const wasPlayer = room.players.some(p => p.socketId === socket.id);
+      room.players = room.players.filter(p => p.socketId !== socket.id);
+      room.spectators = room.spectators.filter(p => p.socketId !== socket.id);
+      if (room.players.length === 0) {
+        delete gameRooms[code];
+      } else if (wasPlayer) {
+        io.to(code).emit("room_update", gameRooms[code]);
+      }
     });
     console.log("❌ Player disconnected:", socket.id);
   });
