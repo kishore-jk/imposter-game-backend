@@ -11,7 +11,6 @@ const jwt        = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const sqlite3    = require("sqlite3").verbose();
 const path       = require("path");
-const nodemailer = require("nodemailer");
 
 const app    = express();
 const server = http.createServer(app);
@@ -21,14 +20,7 @@ const db     = new sqlite3.Database(path.join(__dirname, "voidcrew.db"));
 const PORT   = process.env.PORT || 4000;
 const SECRET = process.env.JWT_SECRET || "voidcrew_secret_change_in_prod";
 
-/* ─── Email Transporter ──────────────────────────────────── */
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+/* ─── Resend Email ───────────────────────────────────────── */
 
 /* ─── OTP Store (in-memory) ──────────────────────────────── */
 const otpStore = {}; // { email: { otp, expires } }
@@ -128,23 +120,34 @@ function fmtUser(u) {
 }
 
 async function sendOtpEmail(email, otp) {
-  await transporter.sendMail({
-    from: `"VoidCrew 🛸" <${process.env.EMAIL_USER}>`,
-    to: email,
-    subject: "Your VoidCrew OTP Code",
-    html: `
-      <div style="background:#050508;padding:40px;font-family:sans-serif;color:#fff;text-align:center;border-radius:12px;">
-        <div style="font-size:48px;margin-bottom:16px;">🛸</div>
-        <h1 style="color:#00f5ff;font-size:28px;letter-spacing:4px;margin-bottom:8px;">VOIDCREW</h1>
-        <p style="color:#aaa;margin-bottom:32px;">Your one-time password</p>
-        <div style="background:#0a0a1a;border:2px solid #00f5ff44;border-radius:12px;padding:24px;margin-bottom:24px;">
-          <div style="font-size:48px;font-weight:bold;letter-spacing:12px;color:#00f5ff;">${otp}</div>
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "VoidCrew <onboarding@resend.dev>",
+      to: email,
+      subject: "Your VoidCrew OTP Code",
+      html: `
+        <div style="background:#050508;padding:40px;font-family:sans-serif;color:#fff;text-align:center;border-radius:12px;">
+          <div style="font-size:48px;margin-bottom:16px;">🛸</div>
+          <h1 style="color:#00f5ff;font-size:28px;letter-spacing:4px;margin-bottom:8px;">VOIDCREW</h1>
+          <p style="color:#aaa;margin-bottom:32px;">Your one-time password</p>
+          <div style="background:#0a0a1a;border:2px solid #00f5ff44;border-radius:12px;padding:24px;margin-bottom:24px;">
+            <div style="font-size:48px;font-weight:bold;letter-spacing:12px;color:#00f5ff;">${otp}</div>
+          </div>
+          <p style="color:#aaa;font-size:13px;">This code expires in <strong style="color:#fff;">10 minutes</strong>.</p>
+          <p style="color:#555;font-size:11px;margin-top:24px;">If you didn't request this, ignore this email.</p>
         </div>
-        <p style="color:#aaa;font-size:13px;">This code expires in <strong style="color:#fff;">10 minutes</strong>.</p>
-        <p style="color:#555;font-size:11px;margin-top:24px;">If you didn't request this, ignore this email.</p>
-      </div>
-    `,
+      `,
+    }),
   });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || "Resend API error");
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
