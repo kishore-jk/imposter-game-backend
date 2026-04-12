@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════════
    VoidCrew Backend — server.js
-   Express + sqlite3 + Socket.IO + JWT
+   Express + sqlite3 + Socket.IO + JWT + Nodemailer OTP
    Run: node server.js
 ═══════════════════════════════════════════════════════════ */
 const express    = require("express");
@@ -11,6 +11,7 @@ const jwt        = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const sqlite3    = require("sqlite3").verbose();
 const path       = require("path");
+const nodemailer = require("nodemailer");
 
 const app    = express();
 const server = http.createServer(app);
@@ -19,6 +20,18 @@ const db     = new sqlite3.Database(path.join(__dirname, "voidcrew.db"));
 
 const PORT   = process.env.PORT || 4000;
 const SECRET = process.env.JWT_SECRET || "voidcrew_secret_change_in_prod";
+
+/* ─── Email Transporter ──────────────────────────────────── */
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+/* ─── OTP Store (in-memory) ──────────────────────────────── */
+const otpStore = {}; // { email: { otp, expires } }
 
 /* ─── Middleware ─────────────────────────────────────────── */
 app.use(cors());
@@ -114,6 +127,26 @@ function fmtUser(u) {
   };
 }
 
+async function sendOtpEmail(email, otp) {
+  await transporter.sendMail({
+    from: `"VoidCrew 🛸" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: "Your VoidCrew OTP Code",
+    html: `
+      <div style="background:#050508;padding:40px;font-family:sans-serif;color:#fff;text-align:center;border-radius:12px;">
+        <div style="font-size:48px;margin-bottom:16px;">🛸</div>
+        <h1 style="color:#00f5ff;font-size:28px;letter-spacing:4px;margin-bottom:8px;">VOIDCREW</h1>
+        <p style="color:#aaa;margin-bottom:32px;">Your one-time password</p>
+        <div style="background:#0a0a1a;border:2px solid #00f5ff44;border-radius:12px;padding:24px;margin-bottom:24px;">
+          <div style="font-size:48px;font-weight:bold;letter-spacing:12px;color:#00f5ff;">${otp}</div>
+        </div>
+        <p style="color:#aaa;font-size:13px;">This code expires in <strong style="color:#fff;">10 minutes</strong>.</p>
+        <p style="color:#555;font-size:11px;margin-top:24px;">If you didn't request this, ignore this email.</p>
+      </div>
+    `,
+  });
+}
+
 /* ═══════════════════════════════════════════════════════════
    ROUTES
 ═══════════════════════════════════════════════════════════ */
@@ -171,13 +204,64 @@ app.post("/api/auth/oauth", async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-/* OTP mock */
-app.post("/api/auth/otp/send", (req, res) => {
-  const otp = Math.floor(100000 + Math.random() * 900000);
-  console.log(`\n[OTP] Code for ${req.body.email}: ${otp}\n`);
-  res.json({ ok: true, _dev_otp: otp });
+/* ─── OTP: Send ──────────────────────────────────────────── */
+app.post("/api/auth/otp/send", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Email required" });
+
+    const user = await get("SELECT id FROM users WHERE email=?", [email.toLowerCase()]);
+    if (!user) return res.status(404).json({ error: "No account found with this email" });
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    otpStore[email.toLowerCase()] = { otp, expires: Date.now() + 10 * 60 * 1000 };
+
+    await sendOtpEmail(email, otp);
+    console.log(`[OTP] Sent to ${email}`);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error("[OTP] Error:", e.message);
+    res.status(500).json({ error: "Failed to send OTP email. Check server email config." });
+  }
 });
-app.post("/api/auth/otp/verify", (req, res) => res.json({ ok: true }));
+
+/* ─── OTP: Verify ────────────────────────────────────────── */
+app.post("/api/auth/otp/verify", (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ error: "Email and OTP required" });
+
+  const record = otpStore[email.toLowerCase()];
+  if (!record) return res.status(400).json({ error: "No OTP sent for this email" });
+  if (Date.now() > record.expires) {
+    delete otpStore[email.toLowerCase()];
+    return res.status(400).json({ error: "OTP expired. Please request a new one." });
+  }
+  if (record.otp !== otp.toString()) return res.status(400).json({ error: "Invalid OTP code" });
+
+  // OTP valid — issue a reset token
+  delete otpStore[email.toLowerCase()];
+  const resetToken = jwt.sign({ email: email.toLowerCase(), purpose: "reset" }, SECRET, { expiresIn: "15m" });
+  res.json({ ok: true, resetToken });
+});
+
+/* ─── Password Reset ─────────────────────────────────────── */
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const { resetToken, newPassword } = req.body;
+    if (!resetToken || !newPassword) return res.status(400).json({ error: "Missing fields" });
+    if (newPassword.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
+    let payload;
+    try { payload = jwt.verify(resetToken, SECRET); }
+    catch { return res.status(400).json({ error: "Reset token expired or invalid" }); }
+
+    if (payload.purpose !== "reset") return res.status(400).json({ error: "Invalid token" });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await run("UPDATE users SET password=? WHERE email=?", [hash, payload.email]);
+    res.json({ ok: true, message: "Password reset successfully! You can now sign in." });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 /* Get Me */
 app.get("/api/user/me", auth, async (req, res) => {
