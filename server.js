@@ -590,23 +590,37 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("player_ready", ({ code, uid, ready }) => {
+  socket.on("player_ready", ({ code, uid }) => {
     const room = code?.toUpperCase();
-    if (gameRooms[room]) {
-      const p = gameRooms[room].players.find(p => p.uid === uid);
-      if (p) p.ready = ready;
-      io.to(room).emit("room_update", gameRooms[room]);
-    }
+    io.to(room).emit("player_ready", { uid });
   });
 
-  socket.on("start_game", async ({ code, map }) => {
+  socket.on("phase_change", ({ code, phase }) => {
+    const room = code?.toUpperCase();
+    io.to(room).emit("phase_change", { phase });
+  });
+
+  socket.on("vote_cast", ({ code, uid, target }) => {
+    const room = code?.toUpperCase();
+    io.to(room).emit("vote_cast", { uid, target });
+  });
+
+  socket.on("vote_result", async ({ code, eliminated, wasImp, winner, scores }) => {
     const room = code?.toUpperCase();
     try {
-      await run("UPDATE rooms SET status='playing', map=? WHERE code=?", [map || "station", room]);
+      await run("UPDATE rooms SET status='ended' WHERE code=?", [room]);
+    } catch(e) {}
+    io.to(room).emit("vote_result", { eliminated, wasImp, winner, scores });
+  });
+
+  socket.on("start_game", async ({ code, object, roles }) => {
+    const room = code?.toUpperCase();
+    try {
+      await run("UPDATE rooms SET status='playing' WHERE code=?", [room]);
       const r = parseRoom(await get("SELECT * FROM rooms WHERE code=?", [room]));
       if (r) {
         gameRooms[room] = r;
-        io.to(room).emit("game_start", { room: r });
+        io.to(room).emit("game_start", { room: r, object, roles });
         console.log(`🎮 Game started in room ${room}`);
       }
     } catch(e) { console.error("start_game error:", e.message); }
