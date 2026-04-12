@@ -1,4 +1,3 @@
-
 /* ═══════════════════════════════════════════════════════════
    VoidCrew Backend — server.js
    Express + sqlite3 + Socket.IO + JWT + Nodemailer OTP
