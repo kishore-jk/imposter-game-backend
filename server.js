@@ -440,9 +440,9 @@ app.post("/api/social/report", auth, async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════════════
-   ROOM MANAGEMENT API
+   ROOM MANAGEMENT API (DB-backed so rooms survive restarts)
 ═══════════════════════════════════════════════════════════ */
-const gameRooms = {}; // { code: { code, host, players, spectators, map, status, created } }
+const gameRooms = {}; // in-memory cache for socket events
 
 function makeRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -451,50 +451,88 @@ function makeRoomCode() {
   return code;
 }
 
+// Setup rooms table
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS rooms (
+    code TEXT PRIMARY KEY,
+    host_uid TEXT NOT NULL,
+    host_nickname TEXT,
+    host_avatar TEXT,
+    map TEXT DEFAULT 'station',
+    status TEXT DEFAULT 'waiting',
+    players TEXT DEFAULT '[]',
+    spectators TEXT DEFAULT '[]',
+    created_at INTEGER
+  )`);
+});
+
+function parseRoom(r) {
+  if (!r) return null;
+  return {
+    code: r.code, map: r.map, status: r.status, created: r.created_at,
+    host: { uid: r.host_uid, nickname: r.host_nickname, avatar: r.host_avatar },
+    players: JSON.parse(r.players || '[]'),
+    spectators: JSON.parse(r.spectators || '[]'),
+  };
+}
+
 // Create room
 app.post("/api/rooms/create", auth, async (req, res) => {
   try {
     const u = await get("SELECT * FROM users WHERE uid=?", [req.uid]);
     let code = makeRoomCode();
-    while (gameRooms[code]) code = makeRoomCode(); // ensure unique
+    while (await get("SELECT code FROM rooms WHERE code=?", [code])) code = makeRoomCode();
     const { map = "station" } = req.body;
-    gameRooms[code] = {
-      code, map, status: "waiting",
-      host: { uid: u.uid, nickname: u.nickname, avatar: u.avatar },
-      players: [{ uid: u.uid, nickname: u.nickname, avatar: u.avatar, ready: true, isHost: true }],
-      spectators: [],
-      created: Date.now()
-    };
+    const hostPlayer = { uid: u.uid, nickname: u.nickname, avatar: u.avatar, ready: true, isHost: true };
+    await run(
+      "INSERT INTO rooms (code, host_uid, host_nickname, host_avatar, map, status, players, spectators, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+      [code, u.uid, u.nickname, u.avatar, map, "waiting", JSON.stringify([hostPlayer]), "[]", Date.now()]
+    );
+    const room = parseRoom(await get("SELECT * FROM rooms WHERE code=?", [code]));
+    gameRooms[code] = room;
     console.log(`🏠 Room created: ${code} by ${u.nickname}`);
-    res.json({ code, room: gameRooms[code] });
+    res.json({ code, room });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Get room info
 app.get("/api/rooms/:code", auth, async (req, res) => {
-  const room = gameRooms[req.params.code.toUpperCase()];
-  if (!room) return res.status(404).json({ error: "Room not found" });
-  res.json(room);
+  try {
+    const code = req.params.code.toUpperCase();
+    const r = await get("SELECT * FROM rooms WHERE code=?", [code]);
+    if (!r) return res.status(404).json({ error: "Room not found. Check the code!" });
+    // Clean up old rooms (older than 4 hours)
+    if (r.created_at && Date.now() - r.created_at > 4 * 60 * 60 * 1000) {
+      await run("DELETE FROM rooms WHERE code=?", [code]);
+      return res.status(404).json({ error: "Room expired. Create a new one!" });
+    }
+    res.json(parseRoom(r));
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Join room
 app.post("/api/rooms/:code/join", auth, async (req, res) => {
   try {
     const code = req.params.code.toUpperCase();
-    const room = gameRooms[code];
-    if (!room) return res.status(404).json({ error: "Room not found. Check the code!" });
-    if (room.status !== "waiting") return res.status(400).json({ error: "Game already started!" });
-    if (room.players.length >= 12) return res.status(400).json({ error: "Room is full!" });
+    const r = await get("SELECT * FROM rooms WHERE code=?", [code]);
+    if (!r) return res.status(404).json({ error: "Room not found. Check the code!" });
+    if (r.status !== "waiting") return res.status(400).json({ error: "Game already started!" });
+    const players = JSON.parse(r.players || "[]");
+    const spectators = JSON.parse(r.spectators || "[]");
+    if (players.length >= 12) return res.status(400).json({ error: "Room is full!" });
     const u = await get("SELECT * FROM users WHERE uid=?", [req.uid]);
-    const { mode = "play" } = req.body; // "play" or "watch"
+    const { mode = "play" } = req.body;
     const player = { uid: u.uid, nickname: u.nickname, avatar: u.avatar, ready: false, isHost: false };
+    let newPlayers = players, newSpectators = spectators;
     if (mode === "watch") {
-      room.spectators = room.spectators.filter(s => s.uid !== u.uid);
-      room.spectators.push(player);
+      newSpectators = [...spectators.filter(s => s.uid !== u.uid), player];
     } else {
-      room.players = room.players.filter(p => p.uid !== u.uid);
-      room.players.push(player);
+      newPlayers = [...players.filter(p => p.uid !== u.uid), player];
     }
+    await run("UPDATE rooms SET players=?, spectators=? WHERE code=?",
+      [JSON.stringify(newPlayers), JSON.stringify(newSpectators), code]);
+    const room = parseRoom(await get("SELECT * FROM rooms WHERE code=?", [code]));
+    gameRooms[code] = room;
     io.to(code).emit("room_update", room);
     console.log(`👤 ${u.nickname} joined room ${code} as ${mode}`);
     res.json({ code, room, mode });
@@ -503,12 +541,13 @@ app.post("/api/rooms/:code/join", auth, async (req, res) => {
 
 // List active rooms (admin)
 app.get("/api/rooms", auth, async (req, res) => {
-  const list = Object.values(gameRooms).map(r => ({
-    code: r.code, map: r.map, status: r.status,
-    players: r.players.length, spectators: r.spectators.length,
-    host: r.host?.nickname, created: r.created
-  }));
-  res.json(list);
+  try {
+    const rows = await all("SELECT * FROM rooms WHERE status != 'ended' ORDER BY created_at DESC LIMIT 50");
+    res.json(rows.map(r => {
+      const p = parseRoom(r);
+      return { code: p.code, map: p.map, status: p.status, players: p.players.length, spectators: p.spectators.length, host: p.host?.nickname, created: p.created };
+    }));
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ═══════════════════════════════════════════════════════════
@@ -517,18 +556,23 @@ app.get("/api/rooms", auth, async (req, res) => {
 io.on("connection", (socket) => {
   console.log("🔌 Player connected:", socket.id);
 
-  socket.on("join_room", ({ code, user }) => {
+  socket.on("join_room", async ({ code, user }) => {
     const room = code?.toUpperCase();
     socket.join(room);
-    // Track socket id for disconnect cleanup
-    if (gameRooms[room]) {
-      const p = gameRooms[room].players.find(p => p.uid === user?.uid);
-      if (p) p.socketId = socket.id;
-      io.to(room).emit("room_update", gameRooms[room]);
-    }
-    // Legacy support
     socket.currentRoom = room;
     socket.currentUid = user?.uid;
+    try {
+      // Load from DB if not cached
+      if (!gameRooms[room]) {
+        const r = await get("SELECT * FROM rooms WHERE code=?", [room]);
+        if (r) gameRooms[room] = parseRoom(r);
+      }
+      if (gameRooms[room]) {
+        const p = gameRooms[room].players.find(p => p.uid === user?.uid);
+        if (p) p.socketId = socket.id;
+        io.to(room).emit("room_update", gameRooms[room]);
+      }
+    } catch(e) {}
   });
 
   socket.on("leave_room", ({ code }) => {
@@ -555,14 +599,17 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("start_game", ({ code, map }) => {
+  socket.on("start_game", async ({ code, map }) => {
     const room = code?.toUpperCase();
-    if (gameRooms[room]) {
-      gameRooms[room].status = "playing";
-      gameRooms[room].map = map || gameRooms[room].map;
-      io.to(room).emit("game_start", { room: gameRooms[room] });
-      console.log(`🎮 Game started in room ${room}`);
-    }
+    try {
+      await run("UPDATE rooms SET status='playing', map=? WHERE code=?", [map || "station", room]);
+      const r = parseRoom(await get("SELECT * FROM rooms WHERE code=?", [room]));
+      if (r) {
+        gameRooms[room] = r;
+        io.to(room).emit("game_start", { room: r });
+        console.log(`🎮 Game started in room ${room}`);
+      }
+    } catch(e) { console.error("start_game error:", e.message); }
   });
 
   socket.on("game_event", ({ code, room, event, data }) => {
@@ -575,13 +622,19 @@ io.on("connection", (socket) => {
     io.to(r).emit("chat", msg);
   });
 
-  socket.on("kick_player", ({ code, uid }) => {
+  socket.on("kick_player", async ({ code, uid }) => {
     const room = code?.toUpperCase();
-    if (gameRooms[room]) {
-      gameRooms[room].players = gameRooms[room].players.filter(p => p.uid !== uid);
-      io.to(room).emit("room_update", gameRooms[room]);
-      io.to(room).emit("kicked", { uid });
-    }
+    try {
+      const r = await get("SELECT * FROM rooms WHERE code=?", [room]);
+      if (r) {
+        const players = JSON.parse(r.players || "[]").filter(p => p.uid !== uid);
+        await run("UPDATE rooms SET players=? WHERE code=?", [JSON.stringify(players), room]);
+        const updated = parseRoom(await get("SELECT * FROM rooms WHERE code=?", [room]));
+        gameRooms[room] = updated;
+        io.to(room).emit("room_update", updated);
+        io.to(room).emit("kicked", { uid });
+      }
+    } catch(e) {}
   });
 
   socket.on("disconnect", () => {
