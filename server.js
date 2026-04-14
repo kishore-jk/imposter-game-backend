@@ -38,7 +38,7 @@ db.serialize(() => {
     password TEXT NOT NULL,
     nickname TEXT NOT NULL,
     photo_url TEXT DEFAULT '',
-    coins INTEGER DEFAULT 150,
+    coins INTEGER DEFAULT 0,
     wins INTEGER DEFAULT 0,
     losses INTEGER DEFAULT 0,
     streak INTEGER DEFAULT 0,
@@ -201,7 +201,7 @@ app.post("/api/auth/register", async(req,res)=>{
     await run("INSERT INTO users (uid,email,password,nickname,is_admin,last_seen) VALUES (?,?,?,?,?,?)",
       [uid,email.toLowerCase(),hash,nickname,isAdm,Date.now()]);
     const u=await get("SELECT * FROM users WHERE uid=?",[uid]);
-    await run("INSERT INTO coin_ledger (user_uid,amount,reason,balance_after) VALUES (?,?,?,?)",[uid,150,"welcome_bonus",150]);
+    await run("INSERT INTO coin_ledger (user_uid,amount,reason,balance_after) VALUES (?,?,?,?)",[uid,0,"account_created",0]);
     res.json({token:sign(uid),user:safe(u)});
   }catch(e){res.status(500).json({error:e.message});}
 });
