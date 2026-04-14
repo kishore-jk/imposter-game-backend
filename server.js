@@ -42,6 +42,8 @@ db.serialize(() => {
     wins INTEGER DEFAULT 0,
     losses INTEGER DEFAULT 0,
     streak INTEGER DEFAULT 0,
+    avg_vote_time REAL DEFAULT 0,
+    total_votes INTEGER DEFAULT 0,
     last_daily TEXT DEFAULT '',
     is_admin INTEGER DEFAULT 0,
     last_seen INTEGER DEFAULT 0,
@@ -291,7 +293,7 @@ app.post("/api/user/change-name", auth, async(req,res)=>{
   try{
     const {nickname}=req.body;
     if(!nickname?.trim()) return res.status(400).json({error:"Name required"});
-    const bal=await deductCoins(req.uid,500,"name_change");
+    const bal=await deductCoins(req.uid,5000,"name_change");
     await run("UPDATE users SET nickname=? WHERE uid=?",[nickname.trim(),req.uid]);
     const u=await get("SELECT * FROM users WHERE uid=?",[req.uid]);
     io.emit("profile_update",{uid:req.uid,nickname:u.nickname,photoUrl:u.photo_url,coins:bal});
@@ -304,7 +306,7 @@ app.post("/api/user/change-photo", auth, async(req,res)=>{
   try{
     const {photoUrl}=req.body;
     if(!photoUrl) return res.status(400).json({error:"Photo required"});
-    const bal=await deductCoins(req.uid,1000,"photo_change");
+    const bal=await deductCoins(req.uid,2000,"photo_change");
     await run("UPDATE users SET photo_url=? WHERE uid=?",[photoUrl,req.uid]);
     const u=await get("SELECT * FROM users WHERE uid=?",[req.uid]);
     io.emit("profile_update",{uid:req.uid,nickname:u.nickname,photoUrl:u.photo_url,coins:bal});
@@ -330,9 +332,12 @@ app.post("/api/user/daily", auth, async(req,res)=>{
 ═══════════════════════════════════════════════════════════ */
 app.get("/api/leaderboard", async(req,res)=>{
   try{
-    const rows=await all("SELECT uid,nickname,photo_url,coins,wins,losses,streak FROM users ORDER BY coins DESC LIMIT 50");
+    // Ranked: coins DESC → wins DESC → avg_vote_time ASC (faster = better tiebreaker)
+    const rows=await all(`SELECT uid,nickname,photo_url,coins,wins,losses,streak,avg_vote_time,total_votes
+      FROM users ORDER BY coins DESC, wins DESC, avg_vote_time ASC LIMIT 50`);
     res.json(rows.map((r,i)=>({...r,photoUrl:r.photo_url,rank:i+1,
-      winRate:r.wins+r.losses>0?Math.round(r.wins/(r.wins+r.losses)*100):0})));
+      winRate:r.wins+r.losses>0?Math.round(r.wins/(r.wins+r.losses)*100):0,
+      avg_vote_time:r.avg_vote_time?Math.round(r.avg_vote_time):null})));
   }catch(e){res.status(500).json({error:e.message});}
 });
 
@@ -496,10 +501,30 @@ app.post("/api/rooms/:code/find-impostor", auth, async(req,res)=>{
     if(!target) return res.status(404).json({error:"Player not found in this game"});
     // Deduct coins FIRST — prevents free clue exploit
     const newBal=await deductCoins(req.uid,200,"find_impostor_clue");
-    const u=await get("SELECT nickname FROM users WHERE uid=?",[req.uid]);
-    // Broadcast coin update to show new balance
     io.to(code).emit("profile_update",{uid:req.uid,coins:newBal});
-    res.json({ok:true,targetName:target.nickname,isImpostor:target.role==="Impostor",newBalance:newBal});
+    // If impostor paid 2000 coins to mask role, show as Crewmate (masked=true)
+    const appearsAsImpostor=target.role==="Impostor"&&!target.masked;
+    res.json({ok:true,targetName:target.nickname,isImpostor:appearsAsImpostor,newBalance:newBal});
+  }catch(e){res.status(400).json({error:e.message});}
+});
+
+// Mask role endpoint — impostor pays 2000 coins to appear as Crewmate to Find Impostor
+app.post("/api/rooms/:code/mask-role", auth, async(req,res)=>{
+  try{
+    const code=req.params.code.toUpperCase();
+    const r=await get("SELECT * FROM rooms WHERE code=?",[code]);
+    if(!r) return res.status(404).json({error:"Room not found"});
+    const roles=JSON.parse(r.roles||"[]");
+    const myRole=roles.find(x=>x.uid===req.uid);
+    if(!myRole||myRole.role!=="Impostor") return res.status(403).json({error:"Only Impostors can mask their role"});
+    // Deduct FIRST — prevents exploit
+    const newBalance=await deductCoins(req.uid,2000,"role_mask");
+    // Mark as masked in room roles
+    const updatedRoles=roles.map(x=>x.uid===req.uid?{...x,masked:true}:x);
+    await run("UPDATE rooms SET roles=? WHERE code=?",[JSON.stringify(updatedRoles),code]);
+    // Broadcast coin update
+    io.to(code).emit("profile_update",{uid:req.uid,coins:newBalance});
+    res.json({ok:true,newBalance});
   }catch(e){res.status(400).json({error:e.message});}
 });
 
@@ -628,7 +653,7 @@ io.on("connection", socket => {
       const players=r?JSON.parse(r.players||"[]"):[];
       await run("INSERT INTO matches (room_code,winner,eliminated_uid,eliminated_name,was_impostor,impostor_guessed,correct_voters,duration,player_count) VALUES (?,?,?,?,?,?,?,?,?)",
         [code,winner,eliminatedUid,eliminatedName,wasImpostor?1:0,impostorGuessed?1:0,JSON.stringify(correctVoters||[]),duration||0,players.length]);
-      // Apply coin scores with transaction safety
+      // Apply coin scores + track vote speed for leaderboard ranking
       for(const [uid,delta] of Object.entries(scores||{})){
         try{
           if(delta>0) await addCoins(uid,delta,`vote_reward_${winner}`);
@@ -640,8 +665,20 @@ io.on("connection", socket => {
           }
           if(winner==="crew"){await run("UPDATE users SET wins=wins+1 WHERE uid=?",[uid]);}
           else{await run("UPDATE users SET losses=losses+1 WHERE uid=?",[uid]);}
+          // Update average vote time (for leaderboard tiebreaker)
+          if(duration&&duration>0){
+            const u2=await get("SELECT avg_vote_time,total_votes FROM users WHERE uid=?",[uid]);
+            const tv=(u2?.total_votes||0)+1;
+            const newAvg=((u2?.avg_vote_time||0)*(tv-1)+duration)/tv;
+            await run("UPDATE users SET avg_vote_time=?,total_votes=? WHERE uid=?",[newAvg,tv,uid]);
+          }
         }catch(er){console.error("Score apply:",er.message);}
       }
+      // Broadcast updated leaderboard to all clients
+      const lb=await all("SELECT uid,nickname,photo_url,coins,wins,losses,streak,avg_vote_time FROM users ORDER BY coins DESC,wins DESC,avg_vote_time ASC LIMIT 50");
+      io.emit("leaderboard_update",lb.map((r,i)=>({...r,photoUrl:r.photo_url,rank:i+1,
+        winRate:r.wins+r.losses>0?Math.round(r.wins/(r.wins+r.losses)*100):0,
+        avg_vote_time:r.avg_vote_time?Math.round(r.avg_vote_time):null})));
       io.to(code).emit("vote_result",{eliminatedUid,eliminatedName,wasImpostor,winner,correctVoters,scores,impostorGuessed});
       delete gameState[code];
       console.log(`✅ Match ended in ${code} — Winner: ${winner}`);
